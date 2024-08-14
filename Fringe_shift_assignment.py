@@ -7,7 +7,6 @@ Created on Sat Jun  1 17:52:51 2024
 
 import pandas as pd
 import numpy as np
-import datetime as dt
 
 class volunteer:
     def __init__(self, name, experience, unavailable=[]):
@@ -87,13 +86,15 @@ class shift:
         return f'Shift covered by {n_ass_vol.name}' if res else f'Shift infeasibly assigned to {n_ass_vol.name}'
             
 class shift_assignment:
-    def __init__(self, shift_file_name, volunteer_filename):
+    def __init__(self, shift_file_name='Fringe_shift_master.csv', 
+                 volunteer_filename='Fringe_volunteer_master.csv', care_exp=True):
         self.new_vols = []
         self.exp_vols = []
         self.shifts = []
+        self.care_exp = care_exp
         
-        vol_table = pd.read_csv('Fringe_volunteer_master.csv', sep=';')
-        shift_table = pd.read_csv('Fringe_shift_master.csv', sep=';')
+        vol_table = pd.read_csv(volunteer_filename, sep=';')
+        shift_table = pd.read_csv(shift_file_name, sep=';')
         
         # read all volunteers and check their availability (X entire day, else from-to in hh:mm format)
         for _,row in vol_table.iterrows():
@@ -119,19 +120,19 @@ class shift_assignment:
         for _, row in shift_table.iterrows():
             self.shifts.append(shift(row[4], row[0], int(row[1]), row[2], row[3]))
             
-    def create_initial_assignment(self, care_exp=True):
+    def create_initial_assignment(self):
         nshifts = len(self.shifts)
         nvols = len(self.new_vols) + len(self.exp_vols)
         shifts_per_vol = int(np.ceil(nshifts / nvols))
         # uncovered_shifts = self.shifts.copy()
-        if care_exp:
+        if self.care_exp:
             to_assign_exp = self.exp_vols*shifts_per_vol
             to_assign = self.new_vols*shifts_per_vol
         else:
             to_assign = (self.exp_vols+self.new_vols)*shifts_per_vol
         
         for sh in self.shifts:
-            if care_exp:
+            if self.care_exp:
                 if sh.id == 'Vol1' and len(to_assign_exp) > 0:
                     v_to_assign = to_assign_exp.pop()
                     sh.assign_volunteer(v_to_assign)
@@ -144,6 +145,9 @@ class shift_assignment:
             else:
                 v_to_assign = to_assign.pop()
                 sh.assign_volunteer(v_to_assign)
+        self.unassigned = to_assign
+        if self.care_exp:
+            self.unassigned_exp = to_assign_exp
                 
     def output_assignment(self):
         res = pd.DataFrame(columns=['location', 'date', 'from', 'to', 'id', 'volunteer'])
@@ -153,3 +157,143 @@ class shift_assignment:
             res = pd.concat([res, pd.DataFrame(sh_dict)])
         return res
                     
+    def fix_infeasible_shift_assignments(self):
+        # returns True if all infeasible shifts could be fixed, else False
+        res = True
+        
+        for sh in self.shifts:
+            vol = sh.assigned_vol
+            sh_tup = (sh.location, sh.date, sh.start, sh.to)
+            if sh_tup in vol.infeasible_shifts:
+                if self.care_exp:
+                    sh_exp = sh.id == 'Vol1'
+                    to_swap = []
+                    # Check if previously unassigned volunteers can cover this shift
+                    if sh_exp:
+                        for ua in self.unassigned_exp:
+                            if ua.is_feasible(sh_tup) and ua.is_unassigned(sh_tup):
+                                to_swap = ua
+                                break
+                    else:
+                        for ua in self.unassigned:
+                            if ua.is_feasible(sh_tup) and ua.is_unassigned(sh_tup):
+                                to_swap = ua
+                                break
+                    if to_swap != []:
+                        # Found someone
+                        sh.assign_volunteer(to_swap)
+                        ua.append(vol)
+                        continue
+                    else:
+                        # Found noone we need to swap shifts
+                        found = False
+                        visited = [vol]
+                        all_vols = self.exp_vols if sh_exp else self.new_vols
+                        p_swaps = [([vol], ps) for ps in np.setdiff1d(all_vols, visited)]
+                        while not found:
+                            npswaps = []
+                            for pswap in p_swaps:
+                                to_cover = [sh_tup] if pswap[0]==[vol] else pswap[0][-1].assigned_shifts + pswap[0][-1].infeasible_shifts
+                                can_cover = False
+                                for cover_sh in to_cover:
+                                    if pswap[1].is_feasible(cover_sh) and pswap[1].is_unassigned(cover_sh):
+                                        can_cover = True
+                                        break
+                                if can_cover: 
+                                    for swap_sh in pswap[1].assigned_shifts + pswap[1].infeasible_shifts:
+                                        if vol.is_feasible(swap_sh) and vol.is_unassigned(swap_sh):
+                                            found = True
+                                            swap_sh.assign_volunteer(vol)
+                                            break
+                                    if found:
+                                        # We found a feasible swapping path
+                                        print('Yay')
+                                        path = pswap[0]+[pswap[1]]
+                                        while len(path) > 2:
+                                            shift_taker = path.pop()
+                                            if path[-1] in self.unassigned:
+                                                self.unassigned.remove(path[-1])
+                                                self.unassigned.append(shift_taker)
+                                            elif path[-1] in self.unassigned_exp:
+                                                self.unassigned_exp.remove(path[-1])
+                                                self.unassigned_exp.append(shift_taker)
+                                            else:
+                                                pot_shifts = path[-1].assigned_shifts + path[-1].infeasible_shifts
+                                                for pot_sh in pot_shifts:
+                                                    if shift_taker.is_feasible(pot_sh) and shift_taker.is_unassigned(pot_sh):
+                                                        pot_sh.assign_volunteer(shift_taker)
+                                                        break
+                                        sh.assign_volunteer(path[1])
+                                    else:
+                                        # We need to search more
+                                        visited.append(pswap[1])
+                                        npswaps.append((pswap[0]+[pswap[1]], np.setdiff1d(all_vols, visited)))
+                            # Checked all possibilities so far 
+                            if set(visited)==set(all_vols):
+                                # We could not find a feasible swap path
+                                res = False
+                                found = True
+                                break
+                            p_swaps = npswaps
+                else:
+                    # We do not care about experience
+                    to_swap = []
+                    # Check if previously unassigned volunteers can cover this shift
+                    for ua in self.unassigned:
+                        if ua.is_feasible(sh_tup) and ua.is_unassigned(sh_tup):
+                            to_swap = ua
+                            break
+                    if to_swap != []:
+                        # Found someone
+                        sh.assign_volunteer(to_swap)
+                        ua.append(vol)
+                        continue
+                    else:
+                        # Found noone we need to swap shifts
+                        found = False
+                        visited = [vol]
+                        all_vols = (self.new_vols + self.exp_vols)
+                        p_swaps = [([vol], ps) for ps in np.setdiff1d(all_vols, visited)]
+                        while not found:
+                            npswaps = []
+                            for pswap in p_swaps:
+                                to_cover = [sh_tup] if pswap[0]==[vol] else pswap[0][-1].assigned_shifts + pswap[0][-1].infeasible_shifts
+                                can_cover = False
+                                for cover_sh in to_cover:
+                                    if pswap[1].is_feasible(cover_sh) and pswap[1].is_unassigned(cover_sh):
+                                        can_cover = True
+                                        break
+                                if can_cover: 
+                                    for swap_sh in pswap[1].assigned_shifts + pswap[1].infeasible_shifts:
+                                        if vol.is_feasible(swap_sh) and vol.is_unassigned(swap_sh):
+                                            found = True
+                                            swap_sh.assign_volunteer(vol)
+                                            break
+                                    if found:
+                                        # We found a feasible swapping path
+                                        print('Yay')
+                                        path = pswap[0]+[pswap[1]]
+                                        while len(path) > 2:
+                                            shift_taker = path.pop()
+                                            if path[-1] in self.unassigned:
+                                                self.unassigned.remove(path[-1])
+                                                self.unassigned.append(shift_taker)
+                                            else:
+                                                pot_shifts = path[-1].assigned_shifts + path[-1].infeasible_shifts
+                                                for pot_sh in pot_shifts:
+                                                    if shift_taker.is_feasible(pot_sh) and shift_taker.is_unassigned(pot_sh):
+                                                        pot_sh.assign_volunteer(shift_taker)
+                                                        break
+                                        sh.assign_volunteer(path[1])
+                                    else:
+                                        # We need to search more
+                                        visited.append(pswap[1])
+                                        npswaps.append((pswap[0]+[pswap[1]], np.setdiff1d(all_vols, visited)))
+                            # Checked all possibilities so far 
+                            if set(visited)==set(all_vols):
+                                # We could not find a feasible swap path
+                                res = False
+                                found = True
+                                break
+                            p_swaps = npswaps    
+        return res
